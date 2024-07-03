@@ -1,2 +1,2 @@
 # Topaz2_5D
-Applies Topaz 2D training and prediction to tomogram slices to predict 3D particle coordinates
+This script extends Topaz (2D) to pick slices of 3D tomograms given tomograms and corresponding 3D coordinates. It extends the capabilities of Topaz by preprocessing tomograms, training models on 2D slices, & aggregating 2D predictions into 3D coordinates.
