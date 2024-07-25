@@ -8,7 +8,8 @@
 # corresponding 3D coordinates. It extends the capabilities of Topaz by preprocessing
 # tomograms, training models on 2D slices, & aggregating 2D predictions into 3D coordinates.
 #
-# Dependencies: Topaz, mrcfile, scikit-learn
+# Dependencies: Topaz
+#               pip install matplotlib mrcfile numpy opencv-python pandas pillow scikit-learn scipy
 #
 # Topaz is distributed under the GPL-3.0 license. For details, see:
 #   https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
+from concurrent.futures import ProcessPoolExecutor
 from scipy.spatial.distance import pdist, squareform
 from sklearn.model_selection import train_test_split
 
@@ -132,7 +134,7 @@ def parse_args(script_start_time):
     io_group = parser.add_argument_group('\033[1mInput/Output Options\033[0m')
     io_group.add_argument("mode", choices=["train", "extract"], help="Mode to run the script in: train or extract")
     io_group.add_argument("-t", "--tomograms", nargs='+', required=True, help="Paths to the input tomograms (MRC files)")
-    io_group.add_argument("-c", "--coordinates", nargs='+', required=True, help="Paths to the input coordinates files (x, y, z for each particle on each new line)")
+    io_group.add_argument("-c", "--coordinates", nargs='+', help="Paths to the input coordinates files (x, y, z for each particle on each new line)")
     io_group.add_argument("-o", "--output", required=True, help="Directory to save output coordinate files")
 
     # General Options
@@ -158,7 +160,7 @@ def parse_args(script_start_time):
     topaz_train_group.add_argument("--image_ext", help="Sets the image extension if loading images from directory. Should include '.' before the extension (default: find all extensions)")
     topaz_train_group.add_argument("--k_fold", type=int, help="Option to split the training set into K folds for cross validation (default: not used)")
     topaz_train_group.add_argument("--fold", type=int, default=0, help="When using K-fold cross validation, sets which fold is used as the heldout test set (default: 0)")
-    topaz_train_group.add_argument("--radius", type=int, default=2, help="Pixel radius around particle centers to consider positive (default: 2)")
+    topaz_train_group.add_argument("--radius", type=int, default=1, help="Pixel radius around particle centers to consider positive (default: 1)")
     topaz_train_group.add_argument("--method", choices=["PN", "GE-KL", "GE-binomial", "PU"], default="GE-binomial", help="Objective function to use for learning the region classifier (default: GE-binomial)")
     topaz_train_group.add_argument("--slack", type=float, help="Weight on GE penalty (default: 10 for GE-KL, 1 for GE-binomial)")
     topaz_train_group.add_argument("--autoencoder", type=float, default=0, help="Option to augment method with autoencoder. Weight on reconstruction error (default: 0)")
@@ -195,6 +197,7 @@ def parse_args(script_start_time):
 
     # System and Program Options
     misc_group = parser.add_argument_group('\033[1mSystem and Program Options\033[0m')
+    misc_group.add_argument("-C", "--cpus", type=int, default=os.cpu_count(), help="Number of CPUs to use for various processing steps. Default is the number of CPU cores available: %(default)s")
     misc_group.add_argument("-V", "--verbosity", type=int, default=1, help="Verbosity level (default: 1)")
     misc_group.add_argument("-v", "--version", action="version", help="Show version number and exit", version=f"Topaz 2.5D v{__version__}")
 
@@ -368,42 +371,67 @@ def slice_tomogram(tomogram, slice_thickness=1):
             slices.append(slice_2d)
     return slices
 
-def slice_and_write_tomograms(tomograms, coordinates, unstack_dir, slice_thickness, num_slices, mark_coords=False):
+def process_tomogram(args):
+    """
+    Helper function to process a single tomogram for parallel execution.
+    
+    :param tuple args: (tomogram_path, coord_path, unstack_dir, slice_thickness, num_slices, mark_coords)
+    :return tuple: (slices, extended_coords, tomogram_name)
+    """
+    tomogram_path, coord_path, unstack_dir, slice_thickness, num_slices, mark_coords = args
+
+    tomogram = readmrc(tomogram_path)
+    
+    print_and_log(f"Slicing tomogram: {tomogram_path}")
+    slices = slice_tomogram(tomogram, slice_thickness)
+    
+    tomogram_name = os.path.basename(tomogram_path).split('.')[0]
+    
+    if coord_path:
+        print_and_log(f"Reading and extending coordinates: {coord_path}")
+        coords = read_coordinates(coord_path)
+        extended_coords = extend_coordinates(coords, num_slices)
+    else:
+        extended_coords = None
+    
+    return slices, extended_coords, tomogram_name
+
+def slice_and_write_tomograms(tomograms, unstack_dir, slice_thickness, num_slices, coordinates=None, mark_coords=False, max_workers=None):
     """
     Slices tomograms (optionally averages based on thickness) and writes them to disk,
-    optionally marking coordinate points on the slices.
+    optionally marking coordinate points on the slices. Uses parallel processing for faster execution.
 
     :param list tomograms: List of tomogram file paths.
-    :param list coordinates: List of coordinate file paths.
     :param str unstack_dir: Directory to save the tomogram slices.
     :param int slice_thickness: Thickness of each slice to average over.
     :param int num_slices: Number of slices to extend coordinates symmetrically vertically.
-    :param bool mark_coords: If True, mark coordinate points on the slices.
-    :return tuple: (all_slices, all_extended_coords)
+    :param list coordinates: Optional list of coordinate file paths. If None, no coordinates are processed.
+    :param bool mark_coords: If True, mark coordinate points on the slices (only if coordinates are provided).
+    :param int max_workers: Maximum number of worker processes to use. If None, it uses the number of CPU cores.
+    :return tuple: (all_slices, all_extended_coords) or just all_slices if no coordinates are provided.
     """
     all_slices = []
-    all_extended_coords = []
+    all_extended_coords = [] if coordinates else None
     slice_index = 0  # Index to keep track of final slice number for unique naming
 
-    for tomogram_path, coord_path in zip(tomograms, coordinates):
-        print_and_log(f"Processing tomogram: {tomogram_path} with coordinates: {coord_path}")
+    # If coordinates are provided, ensure they match the number of tomograms
+    if coordinates and len(tomograms) != len(coordinates):
+        raise ValueError("Number of tomograms and coordinate files must match.")
 
-        tomogram = readmrc(tomogram_path)
+    # Prepare arguments for parallel processing
+    args_list = [(tomogram, coordinates[i] if coordinates else None, unstack_dir, slice_thickness, num_slices, mark_coords) 
+                 for i, tomogram in enumerate(tomograms)]
 
-        print_and_log("Slicing tomogram")
-        slices = slice_tomogram(tomogram, slice_thickness)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(process_tomogram, args_list))
 
-        print_and_log("Reading and extending coordinates")
-        coords = read_coordinates(coord_path)
-        extended_coords = extend_coordinates(coords, num_slices)
-
-        tomogram_name = os.path.basename(tomogram_path).split('.')[0]
-        for i, slice_2d in enumerate(slices):
+    for slices, extended_coords, tomogram_name in results:
+        for j, slice_2d in enumerate(slices):
             slice_name = f"{tomogram_name}_slice_{slice_index:05d}"
             slice_path = f"{unstack_dir}/{slice_name}.mrc"
-            os.makedirs(f"{unstack_dir}", exist_ok=True)
+            os.makedirs(unstack_dir, exist_ok=True)
 
-            if mark_coords:
+            if mark_coords and extended_coords:
                 # Normalize slice to 0-255 range
                 slice_min, slice_max = slice_2d.min(), slice_2d.max()
                 normalized_slice = ((slice_2d - slice_min) / (slice_max - slice_min) * 255).astype(np.uint8)
@@ -414,7 +442,7 @@ def slice_and_write_tomograms(tomograms, coordinates, unstack_dir, slice_thickne
 
                 # Draw coordinate points
                 for x, y, z in extended_coords:
-                    if int(z) == i:
+                    if int(z) == j:
                         draw.ellipse([x-1, y-1, x+1, y+1], fill="white", outline="white")
 
                 # Convert back to numpy array
@@ -424,12 +452,13 @@ def slice_and_write_tomograms(tomograms, coordinates, unstack_dir, slice_thickne
                 writemrc(slice_path, slice_2d)
 
             all_slices.append(slice_path)
-            for x, y, z in extended_coords:
-                if int(z) == i:
-                    all_extended_coords.append((slice_name, x, y))
+            if extended_coords:
+                for x, y, z in extended_coords:
+                    if int(z) == j:
+                        all_extended_coords.append((slice_name, x, y))
             slice_index += 1
 
-    return all_slices, all_extended_coords
+    return (all_slices, all_extended_coords) if coordinates else all_slices
 
 def run_topaz_preprocess(input_dir, output_dir, scale, sample, num_workers, device, niters):
     """
@@ -936,8 +965,8 @@ def main():
         if args.mode == "train":
             print_and_log("Training on all tomograms")
             if not os.path.exists(args.preprocess_dir) or not os.listdir(args.preprocess_dir):
-                print_and_log("Unstacking tomograms")
-                all_slices, all_extended_coords = slice_and_write_tomograms(args.tomograms, args.coordinates, unstack_dir, args.slice_thickness, args.num_slices, mark_coords=False)
+                print_and_log("Unstacking tomograms and extending coordinates")
+                all_slices, all_extended_coords = slice_and_write_tomograms(args.tomograms, unstack_dir, args.slice_thickness, args.num_slices, coordinates=args.coordinates, mark_coords=False, max_workers=args.cpus)
 
                 print_and_log("Saving all extended coordinates for training")
                 write_extended_coordinates(extended_coords_file, all_extended_coords)
@@ -962,17 +991,18 @@ def main():
                             fold=args.fold, radius=args.radius, method=args.method, slack=args.slack, autoencoder=args.autoencoder, l2=args.l2,
                             learning_rate=args.learning_rate, natural=args.natural, minibatch_size=args.minibatch_size,
                             minibatch_balance=args.minibatch_balance, epoch_size=args.epoch_size, num_epochs=args.num_epochs,
-                            pretrained=args.pretrained, no_pretrained=args.no_pretrained, model=args.model, units=args.units,
+                            no_pretrained=args.no_pretrained, model=args.model, units=args.units,
                             dropout=args.dropout, bn=args.bn, pooling=args.pooling, unit_scaling=args.unit_scaling, ngf=args.ngf,
                             save_prefix=args.save_prefix, test_batch_size=args.test_batch_size)
             plot_training_metrics(test_train_curve, train_sample_rate = args.plotting_train_sample_rate)
-            print_and_log(find_best_epoch(test_train_curve))
+            _, _ = find_best_epoch(test_train_curve)
 
         elif args.mode == "extract":
             print_and_log("Extracting particles from all tomograms")
 
             if not os.path.exists(args.preprocess_dir) or not os.listdir(args.preprocess_dir):
-                all_slices, _ = slice_and_write_tomograms(args.tomograms, args.coordinates, unstack_dir, args.slice_thickness, args.num_slices, mark_coords=False)
+                print_and_log("Unstacking tomograms")
+                all_slices = slice_and_write_tomograms(args.tomograms, unstack_dir, args.slice_thickness, args.num_slices, coordinates=None, mark_coords=False, max_workers=args.cpus)
                 print_and_log("Running Topaz preprocess on all slices")
                 run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
             else:
