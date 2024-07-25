@@ -23,7 +23,7 @@ Ensure Topaz is installed according to its installation instructions.
 
 ## Usage
 
-The script can be run from the command line and takes a number of arguments.
+Tomograms should be binned (downsampled betwee 4 and 16 times) prior to using Topaz 2.5D. The script can be run from the command line and takes a number of arguments.
 
 ```bash
 ./topaz2_5d.py train -t tomos/*mrc -c coords/*coords -o output -n 8 -e 1000 -V 2
