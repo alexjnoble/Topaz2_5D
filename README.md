@@ -7,7 +7,9 @@ Topaz 2.5D extends the capabilities of Topaz to pick particles in 3D cryoET tomo
 - Generates 2D slices from 3D tomograms for training and prediction.
 - Trains Topaz models on 2D slices with extended 3D coordinates.
 - Aggregates 2D predictions into 3D coordinates, removing duplicates.
-- Supports both training and extraction modes.
+- Training metrics are plotted and the best iteration is determined in 2 different ways.
+- Topaz scores from 2D predictions are retained in the 3D coordinates.
+- Topaz general model works; training is not necessary.
 - Parallel processing for faster tomogram slicing and coordinate aggregation.
 - Extensive customization options for preprocessing, training, and extraction.
 
