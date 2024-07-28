@@ -15,13 +15,13 @@ Topaz 2.5D extends the capabilities of Topaz to pick particles in 3D cryoET tomo
 
 ## Installation
 
-- Topaz 2.5D requires Python 3, Topaz, and several dependencies, which can be installed using pip:
+Topaz 2.5D requires Python 3, Topaz, and several dependencies, which can be installed using pip:
 
 ```bash
 pip install matplotlib mrcfile numpy opencv-python pandas pillow scikit-learn scipy
 ```
 
-Ensure Topaz is installed according to its installation instructions.
+Ensure Topaz is installed according to its [installation instructions](https://github.com/tbepler/topaz/tree/master?tab=readme-ov-file#installation).
 
 ## Usage
 
@@ -41,7 +41,7 @@ Trains a model on `-t` tomograms matching tomos/*mrc using `-c` coordinates matc
 
 Extracts particles from `-t` tomograms matching tomos/*mrc using a trained model `-m` output/model/all_tomograms_epoch8.sav, with an output directory `-o` output, `-n` 10 slices (5 above and below each particle, defining the particle size), and particle radius `-r` 12 (removes particles closer than 2 x 12 pixels from each other).
 
-Note: If you do not include a model for extraction, then a Topaz 2D general moel will be used.
+Note: If you do not include a model for extraction, then a Topaz 2D general model will be used.
 
 ## Arguments
 
