@@ -66,7 +66,7 @@ Contributions are welcome! Please open a [Pull Request](https://github.com/alexj
 
 ## Author
 
-This script was written by Alex J. Noble with assistance from OpenAI's GPT-4o and Anthropic's Claude 3.5 Sonnet models, 2024 at SEMC.
+This script was written by Alex J. Noble with assistance from Anthropic's Claude 3.5 Sonnet and OpenAI's GPT-4o models, 2024 at SEMC.
 
 ## License
 
