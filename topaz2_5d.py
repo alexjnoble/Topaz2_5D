@@ -135,14 +135,15 @@ def parse_args(script_start_time):
     io_group.add_argument("mode", choices=["train", "extract"], help="Mode to run the script in: train or extract")
     io_group.add_argument("-t", "--tomograms", nargs='+', required=True, help="Paths to the input tomograms (MRC files)")
     io_group.add_argument("-c", "--coordinates", nargs='+', help="Paths to the input coordinates files (x, y, z for each particle on each new line)")
-    io_group.add_argument("-o", "--output", required=True, help="Directory to save output coordinate files")
+    io_group.add_argument("-o", "--output", default='output', help="Directory to save output coordinate files")
+    io_group.add_argument("--model_name", default='particle1', help="Model file name")
 
     # General Options
     general_group = parser.add_argument_group('\033[1mGeneral Options\033[0m')
     general_group.add_argument("-s", "--slice_thickness", type=int, default=1, help="Thickness of each slice for training/prediction where slices are averaged (default: 1)")
     general_group.add_argument("-n", "--num_slices", nargs='+', type=int, default=[10], help="Number of slices to extend symmetrically vertically for training and extraction for each particle type. For training, make this less than the minimum particle radius. For extraction, make this the average particle radius.")
     general_group.add_argument("--scale", type=int, default=1, help="Rescaling factor for tomogram down/upsampling, used in topaz preprocess and extract (default: 1)")
-    general_group.add_argument("-e", "--expected_particles", type=int, help="Expected number of particles per tomogram for training")
+    general_group.add_argument("-e", "--expected_particles", type=int, default=500, help="Expected number of particles per tomogram for training")
     general_group.add_argument("-T", "--test_split", type=float, default=0.2, help="Percentage of tomogram slices to use for testing; remaining are used for training (default: 0.2 = 20%")
     general_group.add_argument("-w", "--num_workers", type=int, default=8, help="Number of worker threads to use for topaz train (default: 8)")
 
@@ -310,8 +311,7 @@ def write_coordinates(coord_path, coordinates):
     :param list coordinates: List of (x, y, z) coordinates.
     """
     with open(coord_path, 'w') as file:
-        for coord in coordinates:
-            file.write(f"{coord[0]} {coord[1]} {coord[2]}\n")
+        file.writelines(f"{x} {y} {z}\n" for x, y, z in coordinates)
 
 def write_extended_coordinates(coord_path, coordinates):
     """
@@ -338,11 +338,8 @@ def extend_coordinates(coords, num_slices):
     :param int num_slices: Number of slices to extend.
     :return list: Extended list of coordinates.
     """
-    extended_coords = []
-    for x, y, z in coords:
-        for i in range(-num_slices, num_slices + 1):
-            extended_coords.append((x, y, z + i))
-    return extended_coords
+    # Extends each (x, y, z) in coords by +/- num_slices along the z-axis.
+    return [(x, y, z + i) for x, y, z in coords for i in range(-num_slices, num_slices + 1)]
 
 def average_slices_per_tomogram(tomogram_paths):
     """
@@ -792,37 +789,51 @@ def normalize_scores(particles):
 
     return particles
 
-def competitive_picking(particles, radii):
+def pick_for_tomogram(args):
     """
-    Perform competitive picking among different particle types.
+    Perform competitive picking for a single tomogram.
 
-    :param pd.DataFrame particles: DataFrame containing normalized particle predictions.
+    :param tuple args: Tuple containing (tomogram_particles, radii)
+    :return DataFrame: DataFrame of selected particles for this tomogram.
+    """
+    tomogram_particles, radii = args
+    tomogram_particles = tomogram_particles.sort_values('normalized_score', ascending=False)
+    coords = tomogram_particles[['x', 'y', 'z']].values
+    
+    to_keep = np.ones(len(tomogram_particles), dtype=bool)
+    for i in range(len(tomogram_particles)):
+        if to_keep[i]:
+            distances = np.linalg.norm(coords[i+1:] - coords[i], axis=1)
+            current_radius = radii[int(tomogram_particles.iloc[i]['type_index'])]
+            other_radii = np.array([radii[int(idx)] for idx in tomogram_particles.iloc[i+1:]['type_index']])
+            max_distances = current_radius + other_radii
+            to_keep[i+1:] &= distances >= max_distances
+    
+    return tomogram_particles[to_keep]
+
+def competitive_picking(particles, radii, max_workers=None):
+    """
+    Perform competitive picking among different particle types across all tomograms in parallel.
+
+    :param pd.DataFrame particles: DataFrame containing normalized particle predictions for all tomograms.
     :param list radii: List of particle radii for each particle type.
+    :param max_workers: Maximum number of worker processes to use. If None, it uses the number of CPU cores.
     :return pd.DataFrame: Final selected particles after competitive picking.
     """
-    final_particles = []
-    for tomogram in particles['tomogram'].unique():
-        # Process each tomogram separately
-        tomogram_particles = particles[particles['tomogram'] == tomogram].sort_values('normalized_score', ascending=False)
-        coords = tomogram_particles[['x', 'y', 'z']].values
-
-        to_keep = np.ones(len(tomogram_particles), dtype=bool)
-        for i in range(len(tomogram_particles)):
-            if to_keep[i]:
-                # Calculate distances to all subsequent particles
-                distances = np.linalg.norm(coords[i+1:] - coords[i], axis=1)
-
-                # Calculate maximum allowed distances based on particle radii
-                current_radius = radii[int(tomogram_particles.iloc[i]['type_index'])]
-                other_radii = [radii[int(idx)] for idx in tomogram_particles.iloc[i+1:]['type_index']]
-                max_distances = current_radius + np.array(other_radii)
-
-                # Mark particles for removal if they're too close
-                to_keep[i+1:] &= distances >= max_distances
-
-        final_particles.append(tomogram_particles[to_keep])
-
-    return pd.concat(final_particles, ignore_index=True)
+    # Group particles by tomogram
+    tomogram_groups = [group for _, group in particles.groupby('tomogram')]
+    
+    # Prepare arguments for parallel processing
+    args_list = [(group, radii) for group in tomogram_groups]
+    
+    # Perform competitive picking in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        picked_particles = list(executor.map(pick_for_tomogram, args_list))
+    
+    # Combine results from all tomograms
+    final_particles = pd.concat(picked_particles, ignore_index=True)
+    
+    return final_particles
 
 def save_aggregated_coordinates(final_particles, threshold, output_dir):
     """
@@ -1083,7 +1094,7 @@ def main():
 
             print_and_log("Running Topaz train")
             os.makedirs(f"{args.output}/model", exist_ok=True)
-            model_save_prefix = f"{args.output}/model/all_tomograms"
+            model_save_prefix = f"{args.output}/model/{args.model_name}"
             test_train_curve = f"{args.output}/model/train_test_curve.txt"
             avg_num_slices = average_slices_per_tomogram(args.tomograms)
             expected_particles_per_slice = (args.expected_particles * (2 * args.num_slices + 1)) / (avg_num_slices // args.slice_thickness)
@@ -1126,7 +1137,7 @@ def main():
 
             picking_type = "Performing competitive picking" if is_competitive else "Selecting final particles"
             print_and_log(picking_type)
-            final_particles = competitive_picking(normalized_predictions, args.particle_radii)
+            final_particles = competitive_picking(normalized_predictions, args.particle_radii, max_workers=args.cpus)
 
             print_and_log("Saving aggregated coordinates")
             save_aggregated_coordinates(final_particles, args.threshold, f"{args.output}/predicted")
