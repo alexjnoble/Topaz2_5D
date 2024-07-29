@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Author: Alex J. Noble, assisted by GPT4o and Claude 3.5 Sonnet, 2024 @SEMC, MIT License
+# Author: Alex J. Noble, assisted by Claude 3.5 Sonnet & GPT4o, 2024 @SEMC, MIT License
 #
 # Topaz 2.5D
 #
@@ -140,7 +140,7 @@ def parse_args(script_start_time):
     # General Options
     general_group = parser.add_argument_group('\033[1mGeneral Options\033[0m')
     general_group.add_argument("-s", "--slice_thickness", type=int, default=1, help="Thickness of each slice for training/prediction where slices are averaged (default: 1)")
-    general_group.add_argument("-n", "--num_slices", type=int, required=True, help="Number of slices to extend symmetrically vertically for training and extraction. For training, make this less than the minimum particle radius. For extraction, make this the average particle radius.")
+    general_group.add_argument("-n", "--num_slices", nargs='+', type=int, default=[10], help="Number of slices to extend symmetrically vertically for training and extraction for each particle type. For training, make this less than the minimum particle radius. For extraction, make this the average particle radius.")
     general_group.add_argument("--scale", type=int, default=1, help="Rescaling factor for tomogram down/upsampling, used in topaz preprocess and extract (default: 1)")
     general_group.add_argument("-e", "--expected_particles", type=int, help="Expected number of particles per tomogram for training")
     general_group.add_argument("-T", "--test_split", type=float, default=0.2, help="Percentage of tomogram slices to use for testing; remaining are used for training (default: 0.2 = 20%")
@@ -185,8 +185,9 @@ def parse_args(script_start_time):
 
     # Extract specific arguments
     topaz_extract_group = parser.add_argument_group('\033[1mExtract Options\033[0m')
-    topaz_extract_group.add_argument("-m", "--model_file", default="resnet16_u64", help="Pretrained model file path for extraction or name of a pretrained model (options: resnet8_u32, resnet8_u64, resnet16_u32, resnet16_u64) (default: resnet16_u64)")
-    topaz_extract_group.add_argument("-r", "--particle_radius", type=int, default=10, help="Particle radius for extraction. Used by Topaz to remove duplicate particles in 2D and by Topaz 2.5D to remove duplicates in 3D.")
+    topaz_extract_group.add_argument("-m", "--model_files", nargs='+', default=["resnet16_u64"], help="Model file paths or names of pretrained models (options: resnet8_u32, resnet8_u64, resnet16_u32, resnet16_u64) (default: resnet16_u64)")
+    topaz_extract_group.add_argument("-r", "--particle_radii", nargs='+', type=int, default=[10], help="Particle radii for each model for extraction. Used by Topaz to remove duplicate particles in 2D and by Topaz 2.5D to remove duplicates in 3D.")
+    topaz_extract_group.add_argument("--names", nargs='+', default=["particle1"], help="Names for each particle type")
     topaz_extract_group.add_argument("--threshold", type=float, default=0, help="Score quantile giving threshold at which to terminate region extraction (default: 0.5)")
     topaz_extract_group.add_argument("--assignment_radius", type=float, help="Maximum distance between prediction and labeled target allowed for considering them a match (default: same as extraction radius)")
     topaz_extract_group.add_argument("--min_radius", type=int, default=5, help="Minimum radius for region extraction when tuning radius parameter (default: 5)")
@@ -205,8 +206,16 @@ def parse_args(script_start_time):
 
     setup_logging(script_start_time, args.verbosity)
 
-    args.num_slices = args.num_slices // 2
+    if args.mode == 'train':
+        args.num_slices = args.num_slices[0] // 2
+    else:
+        args.num_slices = [slice // 2 for slice in args.num_slices]
     args.preprocess_dir = os.path.join(os.getcwd(), args.preprocess_dir)
+    if args.mode == "extract":
+        if len(args.model_files) != len(args.particle_radii) or \
+           len(args.model_files) != len(args.num_slices) or \
+           len(args.model_files) != len(args.names):
+            raise ValueError("Number of models, radii, num_slices, and names must match")
 
     print_and_log(f"\nInput command: {' '.join(sys.argv)}", logging.DEBUG)
 
@@ -313,9 +322,9 @@ def write_extended_coordinates(coord_path, coordinates):
     :param list coordinates: List of tuples (image_name, x, y).
     """
     header = "image_name\tx_coord\ty_coord\n"
-    
+
     mode = 'a' if (os.path.exists(coord_path) and open(coord_path, 'r').readline() == header) else 'w'
-    
+
     with open(coord_path, mode) as file:
         if mode == 'w':
             file.write(header)
@@ -374,26 +383,26 @@ def slice_tomogram(tomogram, slice_thickness=1):
 def process_tomogram(args):
     """
     Helper function to process a single tomogram for parallel execution.
-    
+
     :param tuple args: (tomogram_path, coord_path, unstack_dir, slice_thickness, num_slices, mark_coords)
     :return tuple: (slices, extended_coords, tomogram_name)
     """
     tomogram_path, coord_path, unstack_dir, slice_thickness, num_slices, mark_coords = args
 
     tomogram = readmrc(tomogram_path)
-    
+
     print_and_log(f"Slicing tomogram: {tomogram_path}")
     slices = slice_tomogram(tomogram, slice_thickness)
-    
+
     tomogram_name = os.path.basename(tomogram_path).split('.')[0]
-    
+
     if coord_path:
         print_and_log(f"Reading and extending coordinates: {coord_path}")
         coords = read_coordinates(coord_path)
         extended_coords = extend_coordinates(coords, num_slices)
     else:
         extended_coords = None
-    
+
     return slices, extended_coords, tomogram_name
 
 def slice_and_write_tomograms(tomograms, unstack_dir, slice_thickness, num_slices, coordinates=None, mark_coords=False, max_workers=None):
@@ -601,13 +610,15 @@ def run_topaz_train(train_images_dir, train_targets_file, test_images_file, test
 
 def run_topaz_extract(model_file, input_dir, output_file, particle_radius, scale_factor=1, **kwargs):
     """
-    Run Topaz extract command with additional options.
+    Run Topaz extract command and return the results as a DataFrame.
 
-    :param str model_file: Path to the trained model file.
-    :param str input_dir: Directory of input files.
+    :param str model_file: Path to the trained model file or name of a pretrained model.
+    :param str input_dir: Directory containing input image files.
     :param str output_file: Path to save the output coordinates.
     :param int particle_radius: Radius of particles to extract.
-    :param int scale_factor: Scaling factor for the coordinates.
+    :param int scale_factor: Scaling factor for the coordinates (default: 1).
+    :param kwargs: Additional keyword arguments for Topaz extract.
+    :return pd.DataFrame: DataFrame containing extracted particle coordinates and scores.
     """
     command = [
         "topaz", "extract",
@@ -654,39 +665,43 @@ def read_predictions(pred_path):
 
 def aggregate_predictions(df, num_slices, particle_radius, slice_thickness=1, xy_tolerance=2):
     """
-    Aggregate 2D predictions into 3D coordinates.
+    Aggregate 2D predictions into 3D coordinates and remove duplicates.
 
     :param pd.DataFrame df: DataFrame with columns 'tomogram', 'slice', 'x', 'y', 'score'.
-    :param int num_slices: Number of slices to consider for each particle.
-    :param int slice_thickness: Thickness of each slice used in prediction.
-    :param float xy_tolerance: Tolerance for x and y coordinate similarity (in pixels).
-    :return pd.DataFrame: Aggregated 3D coordinates with scores.
+    :param int or list num_slices: Number of slices to consider for each particle. Can be a single int or a list of ints.
+    :param int particle_radius: Radius of particles for duplicate removal.
+    :param int slice_thickness: Thickness of each slice used in prediction (default: 1).
+    :param float xy_tolerance: Tolerance for x and y coordinate similarity in pixels (default: 2).
+    :return pd.DataFrame: Aggregated and deduplicated 3D coordinates with scores.
     """
+    # If num_slices is a list, use the first (and only) value
+    if isinstance(num_slices, list):
+        num_slices = num_slices[0]
     aggregated_coords = []
 
-    # Process each tomogram separately
     for tomogram in df['tomogram'].unique():
         tomogram_df = df[df['tomogram'] == tomogram].sort_values('slice')
-        
+
         # Create bins for x and y coordinates
         tomogram_df['x_bin'] = (tomogram_df['x'] // xy_tolerance).astype(int)
         tomogram_df['y_bin'] = (tomogram_df['y'] // xy_tolerance).astype(int)
-        
+
         # Group predictions by their x and y bins
         grouped = tomogram_df.groupby(['x_bin', 'y_bin'])
-        
+
         for _, group in grouped:
             if len(group) < 2:  # Ignore single predictions
                 continue
-            
+
             # Check if predictions are within the required number of slices
             slice_range = group['slice'].max() - group['slice'].min() + 1
             if slice_range <= num_slices:
+                # Calculate average coordinates and maximum score
                 avg_x = group['x'].mean()
                 avg_y = group['y'].mean()
                 avg_z = (group['slice'].min() + slice_range / 2) * slice_thickness
                 max_score = group['score'].max()
-                
+
                 aggregated_coords.append({
                     'tomogram': tomogram,
                     'x': avg_x,
@@ -697,21 +712,21 @@ def aggregate_predictions(df, num_slices, particle_radius, slice_thickness=1, xy
 
     # Convert to DataFrame
     result_df = pd.DataFrame(aggregated_coords)
-    
+
     # Remove duplicates
     final_coords = []
     for tomogram in result_df['tomogram'].unique():
         tomogram_df = result_df[result_df['tomogram'] == tomogram].copy()
         coords = tomogram_df[['x', 'y', 'z']].values
-        
+
         # Calculate pairwise distances
         distances = pdist(coords)
         distance_matrix = squareform(distances)
-        
+
         # Find pairs of particles that are too close
         close_pairs = np.argwhere(distance_matrix < 2 * particle_radius)
         close_pairs = close_pairs[close_pairs[:, 0] < close_pairs[:, 1]]  # Keep only upper triangle
-        
+
         # Remove lower scoring particle from each pair
         to_remove = set()
         for i, j in close_pairs:
@@ -719,33 +734,120 @@ def aggregate_predictions(df, num_slices, particle_radius, slice_thickness=1, xy
                 to_remove.add(j)
             else:
                 to_remove.add(i)
-        
+
         # Keep particles that are not in the to_remove set
         keep_indices = [i for i in range(len(tomogram_df)) if i not in to_remove]
         final_coords.extend(tomogram_df.iloc[keep_indices].to_dict('records'))
 
     return pd.DataFrame(final_coords)
 
-def save_aggregated_coordinates(df, threshold, output_file):
+def run_competitive_extraction(tomograms, models, radii, num_slices, names, preprocess_dir, scale, **kwargs):
+    """
+    Run Topaz extract for multiple models and aggregate results for competitive picking.
+
+    :param list tomograms: List of tomogram file paths.
+    :param list models: List of model file paths or names.
+    :param list radii: List of particle radii for each model.
+    :param list num_slices: List of number of slices to consider for each model.
+    :param list names: List of names for each particle type.
+    :param str preprocess_dir: Directory containing preprocessed images.
+    :param int scale: Scaling factor for coordinates.
+    :param kwargs: Additional keyword arguments for Topaz extract.
+    :return pd.DataFrame: Combined and aggregated predictions from all models.
+    """
+    all_predictions = []
+    for i, (model, radius, num_slice, name) in enumerate(zip(models, radii, num_slices, names)):
+        print_and_log(f"Extracting particles for model: {name}")
+        predictions_file = f"{kwargs['output']}/predicted/{name}_predicted_coordinates.txt"
+
+        # Run Topaz extract for current model
+        run_topaz_extract(model, preprocess_dir, predictions_file, radius, scale, **kwargs)
+
+        # Aggregate predictions for current model
+        predictions_df = read_predictions(predictions_file)
+        predictions = aggregate_predictions(predictions_df, num_slice, radius, kwargs.get('slice_thickness', 1))
+
+        # Add particle type information
+        predictions['type'] = name
+        predictions['type_index'] = i
+        all_predictions.append(predictions)
+
+    # Combine predictions from all models
+    return pd.concat(all_predictions, ignore_index=True)
+
+def normalize_scores(particles):
+    """
+    Normalize scores within each particle type.
+
+    :param pd.DataFrame particles: DataFrame containing particle information including scores and types.
+    :return pd.DataFrame: DataFrame with added normalized scores.
+    """
+    for type_name in particles['type'].unique():
+        mask = particles['type'] == type_name
+        min_score = particles.loc[mask, 'score'].min()
+        max_score = particles.loc[mask, 'score'].max()
+
+        # Calculate normalized score for current particle type
+        particles.loc[mask, 'normalized_score'] = (particles.loc[mask, 'score'] - min_score) / (max_score - min_score)
+
+    return particles
+
+def competitive_picking(particles, radii):
+    """
+    Perform competitive picking among different particle types.
+
+    :param pd.DataFrame particles: DataFrame containing normalized particle predictions.
+    :param list radii: List of particle radii for each particle type.
+    :return pd.DataFrame: Final selected particles after competitive picking.
+    """
+    final_particles = []
+    for tomogram in particles['tomogram'].unique():
+        # Process each tomogram separately
+        tomogram_particles = particles[particles['tomogram'] == tomogram].sort_values('normalized_score', ascending=False)
+        coords = tomogram_particles[['x', 'y', 'z']].values
+
+        to_keep = np.ones(len(tomogram_particles), dtype=bool)
+        for i in range(len(tomogram_particles)):
+            if to_keep[i]:
+                # Calculate distances to all subsequent particles
+                distances = np.linalg.norm(coords[i+1:] - coords[i], axis=1)
+
+                # Calculate maximum allowed distances based on particle radii
+                current_radius = radii[int(tomogram_particles.iloc[i]['type_index'])]
+                other_radii = [radii[int(idx)] for idx in tomogram_particles.iloc[i+1:]['type_index']]
+                max_distances = current_radius + np.array(other_radii)
+
+                # Mark particles for removal if they're too close
+                to_keep[i+1:] &= distances >= max_distances
+
+        final_particles.append(tomogram_particles[to_keep])
+
+    return pd.concat(final_particles, ignore_index=True)
+
+def save_aggregated_coordinates(final_particles, threshold, output_dir):
     """
     Save aggregated 3D coordinates to a file.
 
-    :param pd.DataFrame df: DataFrame with columns 'tomogram', 'x', 'y', 'z', 'score'.
-    :param str output_file: Path to save the output file.
+    :param pd.DataFrame final_particles: DataFrame with columns 'tomogram', 'type', 'x', 'y', 'z', 'score', 'normalized_score'.
+    :param float threshold: Topaz score threshold used previously to filter picks.
+    :param str output_dir: Directory to save output files.
     """
-    df.to_csv(output_file, sep='\t', index=False, float_format='%.3f')
+    # Save aggregated_coordinates.txt with all information
+    output_file = os.path.join(output_dir, "aggregated_coordinates.txt")
+    final_particles.to_csv(output_file, sep='\t', index=False, 
+                           columns=['tomogram', 'type', 'x', 'y', 'z', 'score', 'normalized_score'])
 
-    # Save individual .coords files for each tomogram
-    output_dir = os.path.dirname(output_file)
-    for tomogram in df['tomogram'].unique():
-        tomogram_df = df[df['tomogram'] == tomogram]
-        coords_file = os.path.join(output_dir, f"{tomogram}.coords")
-        
-        # Save only x, y, z coordinates, space-delimited, no header
-        tomogram_df[['x', 'y', 'z']].to_csv(coords_file, sep=' ', header=False, index=False, float_format='%.3f')
+    # Save individual .coords files for each tomogram and particle type
+    for tomogram in final_particles['tomogram'].unique():
+        for particle_type in final_particles['type'].unique():
+            mask = (final_particles['tomogram'] == tomogram) & (final_particles['type'] == particle_type)
+            if mask.any():
+                filename = os.path.join(output_dir, f"{tomogram}_{particle_type}.coords")
+                final_particles.loc[mask, ['x', 'y', 'z']].to_csv(filename, sep=' ', header=False, index=False)
 
     print_and_log(f"All coordinates and scores saved: '{output_file}'")
-    print_and_log(f"Tomogram coords (scores > {threshold}) files saved: {output_dir}")
+    print_and_log(f"Individual tomogram and particle type coords files saved in: {output_dir}")
+    print_and_log(f"All coordinates were saved with thresholded scores > {threshold}")
 
 def plot_training_metrics(file_path, train_sample_rate=1):
     """
@@ -784,14 +886,14 @@ def plot_training_metrics(file_path, train_sample_rate=1):
         ax.set_title(title)
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.7)
-        
+
         # Add epoch numbers to x-axis
         ax2 = ax.twiny()
         ax2.set_xlim(ax.get_xlim())
         ax2.set_xticks(test_df['iter'])
         ax2.set_xticklabels(test_df['epoch'], fontweight='bold')
         ax2.set_xlabel('Epoch', fontweight='bold')
-        
+
         # Make iteration ticks less prominent
         ax.tick_params(axis='x', labelsize=8)
         ax.set_xlabel('Iteration', fontsize=10)
@@ -812,12 +914,12 @@ def plot_training_metrics(file_path, train_sample_rate=1):
     ge_min, ge_max = train_df['ge_penalty'].min(), train_df['ge_penalty'].max()
     y_margin = (ge_max - ge_min) * 0.1  # Add 10% margin
     ax2.set_ylim(ge_min - y_margin, ge_max + y_margin)
-    
+
     # Set y-ticks to ensure they are evenly spaced and not too cluttered
     num_ticks = 5  # You can adjust this number for more or fewer ticks
     y_ticks = np.linspace(ge_min, ge_max, num_ticks)
     ax2.set_yticks(y_ticks)
-    
+
     # Format y-tick labels to be more readable
     ax2.set_yticklabels([f'{tick:.2e}' for tick in y_ticks])  # Scientific notation with 2 decimal places
 
@@ -832,7 +934,7 @@ def plot_training_metrics(file_path, train_sample_rate=1):
     ax2_top.set_xticks(test_df['iter'])
     ax2_top.set_xticklabels(test_df['epoch'], fontweight='bold')
     ax2_top.set_xlabel('Epoch', fontweight='bold')
-    
+
     # Make iteration ticks less prominent
     ax2.tick_params(axis='x', labelsize=8)
     ax2.set_xlabel('Iteration', fontsize=10)
@@ -862,7 +964,7 @@ def plot_training_metrics(file_path, train_sample_rate=1):
     auprc_max = test_df['auprc'].max()
     y_margin = (auprc_max - auprc_min) * 0.1  # Add 10% margin
     ax6.set_ylim(auprc_min - y_margin, auprc_max + y_margin)
-    
+
     # Set y-ticks to ensure they are in order
     y_ticks = np.linspace(auprc_min, auprc_max, 10)
     ax6.set_yticks(y_ticks)
@@ -874,7 +976,7 @@ def plot_training_metrics(file_path, train_sample_rate=1):
     ax6_top.set_xticks(test_df['iter'])
     ax6_top.set_xticklabels(test_df['epoch'], fontweight='bold')
     ax6_top.set_xlabel('Epoch', fontweight='bold')
-    
+
     # Make iteration ticks less prominent
     ax6.tick_params(axis='x', labelsize=8)
     ax6.set_xlabel('Iteration', fontsize=10)
@@ -1002,26 +1104,32 @@ def main():
 
             if not os.path.exists(args.preprocess_dir) or not os.listdir(args.preprocess_dir):
                 print_and_log("Unstacking tomograms")
-                all_slices = slice_and_write_tomograms(args.tomograms, unstack_dir, args.slice_thickness, args.num_slices, coordinates=None, mark_coords=False, max_workers=args.cpus)
+                all_slices = slice_and_write_tomograms(args.tomograms, unstack_dir, args.slice_thickness, max(args.num_slices), coordinates=None, mark_coords=False, max_workers=args.cpus)
                 print_and_log("Running Topaz preprocess on all slices")
                 run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
             else:
                 print_and_log("Using existing preprocessed slices")
 
-            print_and_log("Running Topaz extract on all slices")
+            is_competitive = len(args.model_files) > 1
+            extraction_type = "competitive " if is_competitive else ""
+            print_and_log(f"Running {extraction_type}Topaz extract on all slices")
             os.makedirs(f"{args.output}/predicted", exist_ok=True)
-            predictions_file = f"{args.output}/predicted/all_predicted_coordinates.txt"
-            run_topaz_extract(args.model_file, args.preprocess_dir, predictions_file, args.particle_radius, args.scale, threshold=args.threshold,
-                              assignment_radius=args.assignment_radius, min_radius=args.min_radius, max_radius=args.max_radius,
-                              step_radius=args.step_radius, extract_workers=args.extract_workers, targets=args.targets, device=args.device)
+            all_predictions = run_competitive_extraction(args.tomograms, args.model_files, args.particle_radii, args.num_slices, args.names, 
+                                                         args.preprocess_dir, args.scale, threshold=args.threshold,
+                                                         assignment_radius=args.assignment_radius, min_radius=args.min_radius, 
+                                                         max_radius=args.max_radius, step_radius=args.step_radius, 
+                                                         extract_workers=args.extract_workers, targets=args.targets, 
+                                                         device=args.device, output=args.output, slice_thickness=args.slice_thickness)
 
-            print_and_log("Aggregating predictions")
-            predictions_df = read_predictions(predictions_file)
-            aggregated_coords_df = aggregate_predictions(predictions_df, args.num_slices, args.particle_radius, slice_thickness=args.slice_thickness)
+            print_and_log("Normalizing scores")
+            normalized_predictions = normalize_scores(all_predictions)
+
+            picking_type = "Performing competitive picking" if is_competitive else "Selecting final particles"
+            print_and_log(picking_type)
+            final_particles = competitive_picking(normalized_predictions, args.particle_radii)
 
             print_and_log("Saving aggregated coordinates")
-            aggregated_coords_file = f"{args.output}/predicted/aggregated_coordinates.txt"
-            save_aggregated_coordinates(aggregated_coords_df, args.threshold, aggregated_coords_file)
+            save_aggregated_coordinates(final_particles, args.threshold, f"{args.output}/predicted")
 
         end_time = time.time()
         time_str = time_diff(end_time - start_time)
