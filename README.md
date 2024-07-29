@@ -42,6 +42,12 @@ Trains a model on `-t` tomograms matching tomos/*mrc using `-c` coordinates matc
 
 Extracts particles from `-t` tomograms matching tomos/*mrc using a trained model `-m` output/model/all_tomograms_epoch8.sav, with an output directory `-o` output, `-n` 10 slices (5 above and below each particle, defining the particle size), and particle radius `-r` 12 (removes particles closer than 2 x 12 pixels from each other).
 
+```bash
+./topaz2_5d.py extract -t tomos/*mrc --names proteasome pretrained -m output/model/proteasome_epoch8.sav resnet16_u64 -n 8 20 -r 10 22 -V 2
+```
+
+Extracts particles from `-t` tomograms matching tomos/*mrc competitively for particle types with `--names` proteasome and pretrained using a trained model `-m` output/model/proteasome_epoch8.sav and a pretrained model resnet16_u64, `-n` 8 slices for proteasome and 20 slices for pretrained (ie. looking for objects twice the size of proteasomes), particle radius `-r` of 10 and 22 pixels for proteasome and pretrained, respectively, and `-V` verbosity set to 2.
+
 Note: If you do not include a model for extraction, then a Topaz 2D general model will be used.
 
 ## Arguments
