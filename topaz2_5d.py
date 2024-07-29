@@ -19,6 +19,7 @@ __version__ = "1.0.0"
 
 import os
 import sys
+import math
 import time
 import random
 import inspect
@@ -738,9 +739,55 @@ def aggregate_predictions(df, num_slices, particle_radius, slice_thickness=1, xy
 
     return pd.DataFrame(final_coords)
 
+def run_topaz_extract_wrapper(args):
+    """
+    Wrapper function to run Topaz extract for a single model and process the results.
+
+    This function unpacks the arguments, runs Topaz extract, aggregates the predictions,
+    and adds particle type information to the results.
+
+    :param tuple args: A tuple containing the following elements:
+        - model (str): Path to the trained model file or name of a pretrained model.
+        - radius (int): Radius of particles to extract.
+        - num_slice (int): Number of slices to consider for this particle type.
+        - name (str): Name of the particle type.
+        - preprocess_dir (str): Directory containing preprocessed images.
+        - scale (int): Scaling factor for coordinates.
+        - workers_per_extract (int): Number of workers to use for this extraction.
+        - kwargs (dict): Additional keyword arguments for Topaz extract.
+
+    :return pd.DataFrame: DataFrame containing the processed and aggregated predictions
+                          for the current model, including particle type information.
+
+    :raises subprocess.CalledProcessError: If the Topaz extract command fails.
+    :raises FileNotFoundError: If the predictions file is not created.
+    :raises pd.errors.EmptyDataError: If the predictions file is empty or cannot be read.
+    """
+    model, radius, num_slice, name, preprocess_dir, scale, workers_per_extract, kwargs = args
+    print_and_log(f"Extracting particles for model: {name}")
+    predictions_file = f"{kwargs['output']}/predicted/{name}_predicted_coordinates.txt"
+
+    # Update kwargs with the correct number of workers
+    kwargs_copy = kwargs.copy()
+    kwargs_copy['extract_workers'] = workers_per_extract
+
+    # Run Topaz extract for current model
+    predictions = run_topaz_extract(model, preprocess_dir, predictions_file, radius, scale, **kwargs_copy)
+
+    # Aggregate predictions for current model
+    predictions_df = read_predictions(predictions_file)
+    predictions = aggregate_predictions(predictions_df, num_slice, radius, kwargs.get('slice_thickness', 1))
+
+    # Add particle type information
+    predictions['type'] = name
+    predictions['type_index'] = kwargs['type_index']
+
+    return predictions
+
 def run_competitive_extraction(tomograms, models, radii, num_slices, names, preprocess_dir, scale, **kwargs):
     """
     Run Topaz extract for multiple models and aggregate results for competitive picking.
+    This function parallelizes the extraction process based on available CPU cores.
 
     :param list tomograms: List of tomogram file paths.
     :param list models: List of model file paths or names.
@@ -752,22 +799,25 @@ def run_competitive_extraction(tomograms, models, radii, num_slices, names, prep
     :param kwargs: Additional keyword arguments for Topaz extract.
     :return pd.DataFrame: Combined and aggregated predictions from all models.
     """
+    total_cpus = kwargs.get('cpus', os.cpu_count())
+    workers_per_extract = min(8, total_cpus)
+    max_concurrent_extracts = math.floor(total_cpus / workers_per_extract)
+
+    args_list = [
+        (model, radius, num_slice, name, preprocess_dir, scale, workers_per_extract, {**kwargs, 'type_index': i})
+        for i, (model, radius, num_slice, name) in enumerate(zip(models, radii, num_slices, names))
+    ]
+
     all_predictions = []
-    for i, (model, radius, num_slice, name) in enumerate(zip(models, radii, num_slices, names)):
-        print_and_log(f"Extracting particles for model: {name}")
-        predictions_file = f"{kwargs['output']}/predicted/{name}_predicted_coordinates.txt"
 
-        # Run Topaz extract for current model
-        run_topaz_extract(model, preprocess_dir, predictions_file, radius, scale, **kwargs)
+    # Process extractions in batches
+    for i in range(0, len(args_list), max_concurrent_extracts):
+        batch = args_list[i:i+max_concurrent_extracts]
 
-        # Aggregate predictions for current model
-        predictions_df = read_predictions(predictions_file)
-        predictions = aggregate_predictions(predictions_df, num_slice, radius, kwargs.get('slice_thickness', 1))
+        with ProcessPoolExecutor(max_workers=max_concurrent_extracts) as executor:
+            batch_results = list(executor.map(run_topaz_extract_wrapper, batch))
 
-        # Add particle type information
-        predictions['type'] = name
-        predictions['type_index'] = i
-        all_predictions.append(predictions)
+        all_predictions.extend(batch_results)
 
     # Combine predictions from all models
     return pd.concat(all_predictions, ignore_index=True)
@@ -799,7 +849,7 @@ def pick_for_tomogram(args):
     tomogram_particles, radii = args
     tomogram_particles = tomogram_particles.sort_values('normalized_score', ascending=False)
     coords = tomogram_particles[['x', 'y', 'z']].values
-    
+
     to_keep = np.ones(len(tomogram_particles), dtype=bool)
     for i in range(len(tomogram_particles)):
         if to_keep[i]:
@@ -808,7 +858,7 @@ def pick_for_tomogram(args):
             other_radii = np.array([radii[int(idx)] for idx in tomogram_particles.iloc[i+1:]['type_index']])
             max_distances = current_radius + other_radii
             to_keep[i+1:] &= distances >= max_distances
-    
+
     return tomogram_particles[to_keep]
 
 def competitive_picking(particles, radii, max_workers=None):
@@ -822,17 +872,17 @@ def competitive_picking(particles, radii, max_workers=None):
     """
     # Group particles by tomogram
     tomogram_groups = [group for _, group in particles.groupby('tomogram')]
-    
+
     # Prepare arguments for parallel processing
     args_list = [(group, radii) for group in tomogram_groups]
-    
+
     # Perform competitive picking in parallel
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         picked_particles = list(executor.map(pick_for_tomogram, args_list))
-    
+
     # Combine results from all tomograms
     final_particles = pd.concat(picked_particles, ignore_index=True)
-    
+
     return final_particles
 
 def save_aggregated_coordinates(final_particles, threshold, output_dir):
@@ -1130,7 +1180,7 @@ def main():
                                                          assignment_radius=args.assignment_radius, min_radius=args.min_radius, 
                                                          max_radius=args.max_radius, step_radius=args.step_radius, 
                                                          extract_workers=args.extract_workers, targets=args.targets, 
-                                                         device=args.device, output=args.output, slice_thickness=args.slice_thickness)
+                                                         device=args.device, output=args.output, slice_thickness=args.slice_thickness, cpus=args.cpus)
 
             print_and_log("Normalizing scores")
             normalized_predictions = normalize_scores(all_predictions)
