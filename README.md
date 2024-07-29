@@ -10,6 +10,7 @@ Topaz 2.5D extends the capabilities of Topaz to pick particles in 3D cryoET tomo
 - Training metrics are plotted and the best iteration is determined in 2 different ways.
 - Topaz scores from 2D predictions are retained in the 3D coordinates.
 - Topaz general model works; training is not necessary.
+- Compatitive picking supported; pick multiple particle types simultaneously.
 - Parallel processing for faster tomogram slicing and coordinate aggregation.
 - Extensive customization options for preprocessing, training, and extraction.
 
