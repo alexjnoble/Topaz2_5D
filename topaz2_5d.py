@@ -157,6 +157,7 @@ def parse_args(script_start_time):
     topaz_preprocess_group.add_argument("--sample", type=int, default=1, help="Pixel sampling factor for model fit (default: 1)")
     topaz_preprocess_group.add_argument("--preprocess_workers", type=int, default=-1, help="Number of processes to use for parallel image downsampling (default: -1 = all)")
     topaz_preprocess_group.add_argument("--niters", type=int, default=100, help="Number of iterations to run for model fit (default: 100)")
+    topaz_preprocess_group.add_argument("--disable_topaz_preprocess", action="store_true", help="Disable Topaz preprocessing. Normalize slices instead")
 
     # Training specific arguments
     topaz_train_group = parser.add_argument_group('\033[1mTraining Options\033[0m')
@@ -397,7 +398,7 @@ def match_files(tomograms, coordinates):
     :return tuple: Matched pairs, unmatched tomograms, unmatched coordinates
     """
     tomo_names = [strip_extensions(os.path.basename(t)) for t in tomograms]
-    
+
     if not coordinates:
         return [], tomograms, []
 
@@ -436,7 +437,7 @@ def compute_file_hash(filepath):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
-def create_preprocessing_metadata(tomograms, preprocess_dir):
+def create_preprocessing_metadata(tomograms, preprocess_dir, disable_topaz_preprocess=False):
     """
     Create metadata file for preprocessed tomograms.
 
@@ -451,7 +452,8 @@ def create_preprocessing_metadata(tomograms, preprocess_dir):
             } for tomo in tomograms
         ],
         "preprocessing_date": time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
-        "topaz_version": __version__
+        "topaz_version": __version__,
+        "preprocessing_method": "simple_normalization" if disable_topaz_preprocess else "topaz_preprocess"
     }
 
     with open(os.path.join(preprocess_dir, "preprocessing_metadata.json"), "w") as f:
@@ -480,7 +482,7 @@ def check_preprocessing_status(tomograms, preprocess_dir):
 
     return existing_tomos != current_tomos
 
-def prompt_user_for_preprocessing(tomograms, preprocess_dir):
+def prompt_user_for_preprocessing(tomograms, preprocess_dir, disable_topaz_preprocess=False):
     """
     Check if preprocessing is needed and proceed accordingly.
 
@@ -492,11 +494,11 @@ def prompt_user_for_preprocessing(tomograms, preprocess_dir):
     preprocessing_needed = check_preprocessing_status(tomograms, preprocess_dir)
 
     if preprocessing_needed and not os.path.exists(preprocess_dir):
-        print_and_log("Preprocessing is needed. Proceeding with preprocessing.")
+        print_and_log(f"Preprocessing is needed. Proceeding with {'simple normalization' if disable_topaz_preprocess else 'Topaz preprocessing'}.")
         return True
     elif preprocessing_needed:
         while True:
-            choice = input("Mismatch detected between current tomograms and preprocessed data.\nOptions:\n1. Reprocess all files\n2. Show more information\n3. Abort operation\nEnter your choice (1/2/3): ").strip()
+            choice = input(f"Mismatch detected between current tomograms and preprocessed data.\nOptions:\n1. Reprocess all files using {'simple normalization' if disable_topaz_preprocess else 'Topaz preprocessing'}\n2. Show more information\n3. Abort operation\nEnter your choice (1/2/3): ").strip()
             if choice == '1':
                 return True
             elif choice == '2':
@@ -527,7 +529,7 @@ def show_preprocessing_info(tomograms, preprocess_dir, force_print=False):
 
         info.append("Existing preprocessed data:")
         info.append(f"Preprocessing date: {metadata['preprocessing_date']}")
-        info.append(f"Topaz version: {metadata['topaz_version']}")
+        info.append(f"Topaz 2.5D version: {metadata['topaz_version']}")
         info.append("Tomograms:")
         for tomo in metadata["tomograms"]:
             info.append(f"  - {tomo['filename']}")
@@ -566,6 +568,10 @@ def average_slices_per_tomogram(tomogram_paths):
                 slice_counts.append(num_slices)
         except Exception as e:
             print_and_log(f"Error reading {file_path}: {str(e)}")
+
+    if not slice_counts:
+        print_and_log("No valid tomograms found. Cannot calculate average slices.")
+        return 0  # or some default value
 
     average_slices = np.mean(slice_counts)
     return average_slices
@@ -701,6 +707,37 @@ def run_topaz_preprocess(input_dir, output_dir, scale, sample, num_workers, devi
     cmd = " ".join(command)
     print_and_log(cmd)
     subprocess.run(cmd, check=True, shell=True)
+
+def normalize_slice(args):
+    """
+    Normalize a single slice (0 mean, 1 std) and save it.
+
+    :param tuple args: (slice_path, output_path)
+    """
+    slice_path, output_path = args
+    with mrcfile.open(slice_path, permissive=True) as mrc:
+        slice_data = mrc.data
+
+    normalized_slice = (slice_data - np.mean(slice_data)) / np.std(slice_data)
+
+    with mrcfile.new(output_path, overwrite=True) as mrc:
+        mrc.set_data(normalized_slice.astype(np.float32))
+
+def normalize_slices(slice_paths, output_dir, max_workers):
+    """
+    Normalize slices in parallel and save them to the output directory.
+
+    :param list slice_paths: List of paths to input slices
+    :param str output_dir: Directory to save normalized slices
+    :param int max_workers: Maximum number of worker processes to use
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    args_list = [(slice_path, os.path.join(output_dir, os.path.basename(slice_path))) 
+                 for slice_path in slice_paths]
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(normalize_slice, args_list))
 
 def split_dataset(image_dir, particles_file, test_split, seed=None):
     """
@@ -1367,7 +1404,7 @@ def main():
                     print_and_log(f"  - {os.path.basename(coord)}")
 
             # Check preprocessing status and prompt user if necessary
-            if prompt_user_for_preprocessing(all_tomograms, args.preprocess_dir):
+            if prompt_user_for_preprocessing(all_tomograms, args.preprocess_dir, args.disable_topaz_preprocess):
                 print_and_log("Unstacking tomograms and extending coordinates")
                 all_slices, all_extended_coords = slice_and_write_tomograms(tomo_coord_dict, unstack_dir, args.slice_thickness, args.num_slices, mark_coords=False, max_workers=args.cpus)
 
@@ -1377,11 +1414,14 @@ def main():
                 else:
                     print_and_log("No coordinates to extend. Skipping coordinate file creation.")
 
-                print_and_log("Running Topaz preprocess on all slices")
-                run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
+                if args.disable_topaz_preprocess:
+                    print_and_log("Performing simple normalization on all slices")
+                    normalize_slices(all_slices, args.preprocess_dir, args.cpus)
+                else:
+                    print_and_log("Running Topaz preprocess on all slices")
+                    run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
 
-                # Create preprocessing metadata
-                create_preprocessing_metadata(all_tomograms, args.preprocess_dir)
+                create_preprocessing_metadata(all_tomograms, args.preprocess_dir, args.disable_topaz_preprocess)
 
             print_and_log("Splitting the dataset into test and train")
             split_dataset(args.preprocess_dir, extended_coords_file, args.test_split)
@@ -1390,7 +1430,7 @@ def main():
             os.makedirs(f"{args.output}/model", exist_ok=True)
             model_save_prefix = f"{args.output}/model/{args.model_name}"
             test_train_curve = f"{args.output}/model/train_test_curve.txt"
-            avg_num_slices = average_slices_per_tomogram(args.tomograms)
+            avg_num_slices = average_slices_per_tomogram(all_tomograms)
             expected_particles_per_slice = (args.expected_particles * (2 * args.num_slices + 1)) / (avg_num_slices // args.slice_thickness)
             run_topaz_train(args.preprocess_dir, f"{args.preprocess_dir}/particles_train.txt", f"{args.preprocess_dir}/image_list_test.txt",
                             f"{args.preprocess_dir}/particles_test.txt", model_save_prefix, test_train_curve, expected_particles_per_slice,
@@ -1407,20 +1447,21 @@ def main():
         elif args.mode == "extract":
             print_and_log("Extracting particles from all tomograms")
 
-            # Get file list for tomograms
-            tomogram_files = get_file_list(args.tomograms, ['.mrc'])
-
             # Check preprocessing status and prompt user if necessary
-            if prompt_user_for_preprocessing(tomogram_files, args.preprocess_dir):
+            if prompt_user_for_preprocessing(tomogram_files, args.preprocess_dir, args.disable_topaz_preprocess):
                 print_and_log("Unstacking tomograms")
                 # Create a dictionary with tomogram paths as both keys and values
                 tomo_dict = {tomo: tomo for tomo in tomogram_files}
                 all_slices = slice_and_write_tomograms(tomo_dict, unstack_dir, args.slice_thickness, max(args.num_slices), mark_coords=False, max_workers=args.cpus)
-                print_and_log("Running Topaz preprocess on all slices")
-                run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
+                
+                if args.disable_topaz_preprocess:
+                    print_and_log("Performing simple normalization on all slices")
+                    normalize_slices(all_slices, args.preprocess_dir, args.cpus)
+                else:
+                    print_and_log("Running Topaz preprocess on all slices")
+                    run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
 
-                # Create preprocessing metadata
-                create_preprocessing_metadata(tomogram_files, args.preprocess_dir)
+                create_preprocessing_metadata(tomogram_files, args.preprocess_dir, args.disable_topaz_preprocess)
             else:
                 print_and_log("Using existing preprocessed slices")
 
