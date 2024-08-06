@@ -19,9 +19,12 @@ __version__ = "1.0.0"
 
 import os
 import sys
+import glob
+import json
 import math
 import time
 import random
+import hashlib
 import inspect
 import logging
 import mrcfile
@@ -134,8 +137,8 @@ def parse_args(script_start_time):
     # Input/Output Options
     io_group = parser.add_argument_group('\033[1mInput/Output Options\033[0m')
     io_group.add_argument("mode", choices=["train", "extract"], help="Mode to run the script in: train or extract")
-    io_group.add_argument("-t", "--tomograms", nargs='+', required=True, help="Paths to the input tomograms (MRC files)")
-    io_group.add_argument("-c", "--coordinates", nargs='+', help="Paths to the input coordinates files (x, y, z for each particle on each new line)")
+    io_group.add_argument("-t", "--tomograms", nargs='+', required=True, help="Paths to the input tomograms (MRC files) or directories containing MRC files")
+    io_group.add_argument("-c", "--coordinates", nargs='+', help="Paths to the input coordinates files (x, y, z for each particle on each new line) or directories containing .coords, .txt, or .csv files")
     io_group.add_argument("-o", "--output", default='output', help="Directory to save output coordinate files")
     io_group.add_argument("--model_name", default='particle1', help="Model file name")
 
@@ -249,6 +252,24 @@ def time_diff(time_diff):
 
     return time_str
 
+def get_file_list(paths, extensions):
+    """
+    Get a list of files with specified extensions from given paths or directories.
+
+    :param list paths: List of file paths or directories
+    :param list extensions: List of file extensions to look for (e.g., ['.mrc', '.coords'])
+    :return list: List of file paths
+    """
+    file_list = []
+    for path in paths:
+        if os.path.isdir(path):
+            for ext in extensions:
+                file_list.extend(glob.glob(os.path.join(path, f'*{ext}')))
+        elif os.path.isfile(path):
+            if any(path.endswith(ext) for ext in extensions):
+                file_list.append(path)
+    return sorted(set(file_list))  # Remove duplicates and sort
+
 def readmrc(mrc_path):
     """
     Read an MRC file and return its data as a NumPy array.
@@ -286,12 +307,14 @@ def writemrc(mrc_path, numpy_array, voxelsize=1.0):
 def read_coordinates(coord_path):
     """
     Read coordinates from a file and return as a list of tuples.
-
     This function automatically detects space, tab, and comma delimiters.
+    If the file doesn't exist, return an empty list.
 
     :param str coord_path: Path to the coordinate file.
-    :return list: List of (x, y, z) coordinates.
+    :return list: List of (x, y, z) coordinates, or an empty list if file doesn't exist.
     """
+    if not os.path.exists(coord_path):
+        return []
     coordinates = []
     with open(coord_path, 'r') as file:
         for line in file:
@@ -342,6 +365,191 @@ def extend_coordinates(coords, num_slices):
     # Extends each (x, y, z) in coords by +/- num_slices along the z-axis.
     return [(x, y, z + i) for x, y, z in coords for i in range(-num_slices, num_slices + 1)]
 
+def get_unique_prefix_length(filenames):
+    """
+    Determine the minimum length of prefix needed to uniquely identify each filename.
+
+    :param list filenames: List of filenames to analyze
+    :return int: Minimum length of unique prefix
+    """
+    max_len = max(len(f) for f in filenames)
+    for i in range(1, max_len + 1):
+        prefixes = set(f[:i] for f in filenames)
+        if len(prefixes) == len(filenames):
+            return i
+    return max_len
+
+def strip_extensions(filename):
+    """
+    Strip all extensions from a filename.
+
+    :param str filename: The filename to strip
+    :return str: Filename without extensions
+    """
+    return filename.split('.')[0]
+
+def match_files(tomograms, coordinates):
+    """
+    Match tomogram files with coordinate files based on unique prefixes.
+
+    :param list tomograms: List of tomogram file paths
+    :param list coordinates: List of coordinate file paths (can be empty)
+    :return tuple: Matched pairs, unmatched tomograms, unmatched coordinates
+    """
+    tomo_names = [strip_extensions(os.path.basename(t)) for t in tomograms]
+    
+    if not coordinates:
+        return [], tomograms, []
+
+    coord_names = [strip_extensions(os.path.basename(c)) for c in coordinates]
+
+    # Create a mapping of stripped names to original filenames
+    tomo_dict = {name: t for name, t in zip(tomo_names, tomograms)}
+    coord_dict = {name: c for name, c in zip(coord_names, coordinates)}
+
+    matched_pairs = []
+    unmatched_tomos = []
+    unmatched_coords = []
+
+    # Match files based on exact stripped names
+    for name in set(tomo_names) & set(coord_names):
+        matched_pairs.append((tomo_dict[name], coord_dict[name]))
+
+    for name in set(tomo_names) - set(coord_names):
+        unmatched_tomos.append(tomo_dict[name])
+
+    for name in set(coord_names) - set(tomo_names):
+        unmatched_coords.append(coord_dict[name])
+
+    return matched_pairs, unmatched_tomos, unmatched_coords
+
+def compute_file_hash(filepath):
+    """
+    Compute SHA256 hash of a file.
+
+    :param str filepath: Path to the file
+    :return str: Hexadecimal digest of the file hash
+    """
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+def create_preprocessing_metadata(tomograms, preprocess_dir):
+    """
+    Create metadata file for preprocessed tomograms.
+
+    :param list tomograms: List of tomogram file paths
+    :param str preprocess_dir: Directory where preprocessed files are stored
+    """
+    metadata = {
+        "tomograms": [
+            {
+                "filename": os.path.basename(tomo),
+                "hash": compute_file_hash(tomo)
+            } for tomo in tomograms
+        ],
+        "preprocessing_date": time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+        "topaz_version": __version__
+    }
+
+    with open(os.path.join(preprocess_dir, "preprocessing_metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
+def check_preprocessing_status(tomograms, preprocess_dir):
+    """
+    Check if preprocessing is needed based on existing metadata.
+
+    :param list tomograms: List of tomogram file paths
+    :param str preprocess_dir: Directory where preprocessed files are stored
+    :return bool: True if preprocessing is needed, False otherwise
+    """
+    if not os.path.exists(preprocess_dir):
+        return True
+
+    metadata_file = os.path.join(preprocess_dir, "preprocessing_metadata.json")
+    if not os.path.exists(metadata_file):
+        return True
+
+    with open(metadata_file, "r") as f:
+        metadata = json.load(f)
+
+    existing_tomos = {tomo["filename"]: tomo["hash"] for tomo in metadata["tomograms"]}
+    current_tomos = {os.path.basename(tomo): compute_file_hash(tomo) for tomo in tomograms}
+
+    return existing_tomos != current_tomos
+
+def prompt_user_for_preprocessing(tomograms, preprocess_dir):
+    """
+    Check if preprocessing is needed and proceed accordingly.
+
+    :param list tomograms: List of tomogram file paths
+    :param str preprocess_dir: Directory where preprocessed files are stored
+    :return bool: True if preprocessing is needed or user confirms preprocessing, False if user aborts
+    """
+    print_and_log("Preprocessing status check...")
+    preprocessing_needed = check_preprocessing_status(tomograms, preprocess_dir)
+
+    if preprocessing_needed and not os.path.exists(preprocess_dir):
+        print_and_log("Preprocessing is needed. Proceeding with preprocessing.")
+        return True
+    elif preprocessing_needed:
+        while True:
+            choice = input("Mismatch detected between current tomograms and preprocessed data.\nOptions:\n1. Reprocess all files\n2. Show more information\n3. Abort operation\nEnter your choice (1/2/3): ").strip()
+            if choice == '1':
+                return True
+            elif choice == '2':
+                show_preprocessing_info(tomograms, preprocess_dir, force_print=True)
+            elif choice == '3':
+                print_and_log("Operation aborted by user.")
+                sys.exit(0)
+            else:
+                print_and_log("Invalid choice. Please enter 1, 2, or 3.")
+    else:
+        print_and_log("Preprocessed data is up-to-date. No reprocessing needed.")
+        return False
+
+def show_preprocessing_info(tomograms, preprocess_dir, force_print=False):
+    """
+    Show detailed information about preprocessing status.
+
+    :param list tomograms: List of tomogram file paths
+    :param str preprocess_dir: Directory where preprocessed files are stored
+    :param bool force_print: If True, print information regardless of verbosity level
+    """
+    info = ["\nDetailed preprocessing information:"]
+
+    metadata_file = os.path.join(preprocess_dir, "preprocessing_metadata.json")
+    if os.path.exists(metadata_file):
+        with open(metadata_file, "r") as f:
+            metadata = json.load(f)
+
+        info.append("Existing preprocessed data:")
+        info.append(f"Preprocessing date: {metadata['preprocessing_date']}")
+        info.append(f"Topaz version: {metadata['topaz_version']}")
+        info.append("Tomograms:")
+        for tomo in metadata["tomograms"]:
+            info.append(f"  - {tomo['filename']}")
+    else:
+        info.append("No existing preprocessing metadata found.")
+
+    info.append("\nCurrent tomograms:")
+    for tomo in tomograms:
+        info.append(f"  - {os.path.basename(tomo)}")
+
+    info.append("\nDebug information:")
+    info.append("Tomogram files:")
+    for tomo in tomograms:
+        info.append(f"  - {tomo}")
+
+    if force_print or global_verbosity >= 2:
+        for line in info:
+            print(line)
+    else:
+        for line in info:
+            print_and_log(line, level=logging.DEBUG)
+
 def average_slices_per_tomogram(tomogram_paths):
     """
     Calculate the average number of slices per tomogram for the given list of tomogram file paths.
@@ -382,10 +590,10 @@ def process_tomogram(args):
     """
     Helper function to process a single tomogram for parallel execution.
 
-    :param tuple args: (tomogram_path, coord_path, unstack_dir, slice_thickness, num_slices, mark_coords)
+    :param tuple args: (tomogram_path, coordinates, unstack_dir, slice_thickness, num_slices, mark_coords)
     :return tuple: (slices, extended_coords, tomogram_name)
     """
-    tomogram_path, coord_path, unstack_dir, slice_thickness, num_slices, mark_coords = args
+    tomogram_path, coordinates, unstack_dir, slice_thickness, num_slices, mark_coords = args
 
     tomogram = readmrc(tomogram_path)
 
@@ -394,40 +602,40 @@ def process_tomogram(args):
 
     tomogram_name = os.path.basename(tomogram_path).split('.')[0]
 
-    if coord_path:
-        print_and_log(f"Reading and extending coordinates: {coord_path}")
-        coords = read_coordinates(coord_path)
-        extended_coords = extend_coordinates(coords, num_slices)
+    if coordinates:
+        print_and_log(f"Extending coordinates for: {tomogram_path}")
+        extended_coords = extend_coordinates(coordinates, num_slices)
     else:
-        extended_coords = None
+        extended_coords = []
 
     return slices, extended_coords, tomogram_name
 
-def slice_and_write_tomograms(tomograms, unstack_dir, slice_thickness, num_slices, coordinates=None, mark_coords=False, max_workers=None):
+def slice_and_write_tomograms(tomo_coord_dict, unstack_dir, slice_thickness, num_slices, mark_coords=False, max_workers=None):
     """
-    Slices tomograms (optionally averages based on thickness) and writes them to disk,
-    optionally marking coordinate points on the slices. Uses parallel processing for faster execution.
+    Slices tomograms and writes them to disk, optionally marking coordinate points on the slices.
 
-    :param list tomograms: List of tomogram file paths.
+    :param dict tomo_coord_dict: Dictionary mapping tomogram paths to lists of coordinates (or tomogram paths only for extract mode).
     :param str unstack_dir: Directory to save the tomogram slices.
     :param int slice_thickness: Thickness of each slice to average over.
     :param int num_slices: Number of slices to extend coordinates symmetrically vertically.
-    :param list coordinates: Optional list of coordinate file paths. If None, no coordinates are processed.
     :param bool mark_coords: If True, mark coordinate points on the slices (only if coordinates are provided).
     :param int max_workers: Maximum number of worker processes to use. If None, it uses the number of CPU cores.
     :return tuple: (all_slices, all_extended_coords) or just all_slices if no coordinates are provided.
     """
     all_slices = []
-    all_extended_coords = [] if coordinates else None
-    slice_index = 0  # Index to keep track of final slice number for unique naming
+    all_extended_coords = []
+    slice_index = 0
 
-    # If coordinates are provided, ensure they match the number of tomograms
-    if coordinates and len(tomograms) != len(coordinates):
-        raise ValueError("Number of tomograms and coordinate files must match.")
+    # Check if we're in extract mode (no coordinates)
+    extract_mode = isinstance(next(iter(tomo_coord_dict.values())), str)
 
     # Prepare arguments for parallel processing
-    args_list = [(tomogram, coordinates[i] if coordinates else None, unstack_dir, slice_thickness, num_slices, mark_coords) 
-                 for i, tomogram in enumerate(tomograms)]
+    if extract_mode:
+        args_list = [(tomo, None, unstack_dir, slice_thickness, num_slices, mark_coords) 
+                     for tomo in tomo_coord_dict]
+    else:
+        args_list = [(tomo, coords, unstack_dir, slice_thickness, num_slices, mark_coords) 
+                     for tomo, coords in tomo_coord_dict.items()]
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(process_tomogram, args_list))
@@ -465,7 +673,7 @@ def slice_and_write_tomograms(tomograms, unstack_dir, slice_thickness, num_slice
                         all_extended_coords.append((slice_name, x, y))
             slice_index += 1
 
-    return (all_slices, all_extended_coords) if coordinates else all_slices
+    return (all_slices, all_extended_coords) if all_extended_coords else all_slices
 
 def run_topaz_preprocess(input_dir, output_dir, scale, sample, num_workers, device, niters):
     """
@@ -1123,21 +1331,57 @@ def main():
 
     unstack_dir = os.path.join(os.getcwd(), "unstacked")
     extended_coords_file = f"{unstack_dir}/extended_coordinates.txt"
-
+    # Get file lists for tomograms and coordinates
+    tomogram_files = get_file_list(args.tomograms, ['.mrc'])
+    coordinate_files = get_file_list(args.coordinates, ['.coords', '.txt', '.csv']) if args.coordinates else []
     try:
         if args.mode == "train":
             print_and_log("Training on all tomograms")
-            if not os.path.exists(args.preprocess_dir) or not os.listdir(args.preprocess_dir):
+
+            # Match tomograms with coordinate files
+            matched_pairs, unmatched_tomos, unmatched_coords = match_files(tomogram_files, coordinate_files)
+
+            # Create a dictionary of tomograms and their coordinates
+            tomo_coord_dict = {}
+            for tomo, coord in matched_pairs:
+                tomo_coord_dict[tomo] = read_coordinates(coord)
+
+            if unmatched_tomos:
+                print_and_log("Warning: The following tomograms have no matching coordinate files:")
+                for tomo in unmatched_tomos:
+                    print_and_log(f"  - {os.path.basename(tomo)}")
+
+                include_unpaired = input("Include unpaired tomograms in training? (y/n): ").strip().lower() == 'y'
+                if include_unpaired:
+                    print_and_log("Including unpaired tomograms in training")
+                    for tomo in unmatched_tomos:
+                        tomo_coord_dict[tomo] = []
+                else:
+                    print_and_log("Excluding unpaired tomograms from training")
+
+            all_tomograms = list(tomo_coord_dict.keys())
+
+            if unmatched_coords:
+                print_and_log("Warning: The following coordinate files have no matching tomograms and will be ignored:")
+                for coord in unmatched_coords:
+                    print_and_log(f"  - {os.path.basename(coord)}")
+
+            # Check preprocessing status and prompt user if necessary
+            if prompt_user_for_preprocessing(all_tomograms, args.preprocess_dir):
                 print_and_log("Unstacking tomograms and extending coordinates")
-                all_slices, all_extended_coords = slice_and_write_tomograms(args.tomograms, unstack_dir, args.slice_thickness, args.num_slices, coordinates=args.coordinates, mark_coords=False, max_workers=args.cpus)
+                all_slices, all_extended_coords = slice_and_write_tomograms(tomo_coord_dict, unstack_dir, args.slice_thickness, args.num_slices, mark_coords=False, max_workers=args.cpus)
 
                 print_and_log("Saving all extended coordinates for training")
-                write_extended_coordinates(extended_coords_file, all_extended_coords)
+                if all_extended_coords:
+                    write_extended_coordinates(extended_coords_file, all_extended_coords)
+                else:
+                    print_and_log("No coordinates to extend. Skipping coordinate file creation.")
 
                 print_and_log("Running Topaz preprocess on all slices")
                 run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
-            else:
-                print_and_log("Using existing preprocessed slices")
+
+                # Create preprocessing metadata
+                create_preprocessing_metadata(all_tomograms, args.preprocess_dir)
 
             print_and_log("Splitting the dataset into test and train")
             split_dataset(args.preprocess_dir, extended_coords_file, args.test_split)
@@ -1163,11 +1407,20 @@ def main():
         elif args.mode == "extract":
             print_and_log("Extracting particles from all tomograms")
 
-            if not os.path.exists(args.preprocess_dir) or not os.listdir(args.preprocess_dir):
+            # Get file list for tomograms
+            tomogram_files = get_file_list(args.tomograms, ['.mrc'])
+
+            # Check preprocessing status and prompt user if necessary
+            if prompt_user_for_preprocessing(tomogram_files, args.preprocess_dir):
                 print_and_log("Unstacking tomograms")
-                all_slices = slice_and_write_tomograms(args.tomograms, unstack_dir, args.slice_thickness, max(args.num_slices), coordinates=None, mark_coords=False, max_workers=args.cpus)
+                # Create a dictionary with tomogram paths as both keys and values
+                tomo_dict = {tomo: tomo for tomo in tomogram_files}
+                all_slices = slice_and_write_tomograms(tomo_dict, unstack_dir, args.slice_thickness, max(args.num_slices), mark_coords=False, max_workers=args.cpus)
                 print_and_log("Running Topaz preprocess on all slices")
                 run_topaz_preprocess(unstack_dir, args.preprocess_dir, args.scale, args.sample, args.preprocess_workers, args.device, args.niters)
+
+                # Create preprocessing metadata
+                create_preprocessing_metadata(tomogram_files, args.preprocess_dir)
             else:
                 print_and_log("Using existing preprocessed slices")
 
@@ -1194,11 +1447,11 @@ def main():
 
         end_time = time.time()
         time_str = time_diff(end_time - start_time)
-        print_and_log(f"Topaz 2.5D processing completed in \033[1m{time_str}\033[0m.")
+        print_and_log(f"Topaz 2.5D {'training' if args.mode == 'train' else 'extracting' if args.mode == 'extract' else 'processing'} completed in \033[1m{time_str}\033[0m.")
 
     except Exception as e:
         print_and_log(f"Error occurred: {e}", level=logging.ERROR)
-        raise
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
