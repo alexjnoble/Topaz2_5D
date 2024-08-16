@@ -24,6 +24,8 @@ pip install matplotlib mrcfile numpy opencv-python pandas pillow scikit-learn sc
 
 Ensure Topaz is installed according to its [installation instructions](https://github.com/tbepler/topaz/tree/master?tab=readme-ov-file#installation).
 
+To use Topaz 2.5D, download the topaz2_5d.py file directly and place it in your working directory or environment for use. Make it executable on Linux with this command: `chmod +x topaz2_5d.py`.
+
 ## Usage
 
 Tomograms should be binned (downsampled betwee 4 and 16 times) prior to using Topaz 2.5D. Tomograms should be in .mrc format and coordinates should be in x,y,z format (space-delimited, no commas; one particle per line, one file per tomogram with the same basename as the tmogram).
