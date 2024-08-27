@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.spatial.distance import pdist, squareform
 from sklearn.model_selection import train_test_split
 
@@ -424,19 +424,6 @@ def match_files(tomograms, coordinates):
 
     return matched_pairs, unmatched_tomos, unmatched_coords
 
-def compute_file_hash(filepath):
-    """
-    Compute SHA256 hash of a file.
-
-    :param str filepath: Path to the file
-    :return str: Hexadecimal digest of the file hash
-    """
-    sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
-
 def create_preprocessing_metadata(tomograms, preprocess_dir, disable_topaz_preprocess=False):
     """
     Create metadata file for preprocessed tomograms.
@@ -459,6 +446,19 @@ def create_preprocessing_metadata(tomograms, preprocess_dir, disable_topaz_prepr
     with open(os.path.join(preprocess_dir, "preprocessing_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
+def compute_file_hash(filepath):
+    """
+    Compute SHA256 hash of a file.
+
+    :param str filepath: Path to the file
+    :return str: Hexadecimal digest of the file hash
+    """
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
 def check_preprocessing_status(tomograms, preprocess_dir):
     """
     Check if preprocessing is needed based on existing metadata.
@@ -478,7 +478,18 @@ def check_preprocessing_status(tomograms, preprocess_dir):
         metadata = json.load(f)
 
     existing_tomos = {tomo["filename"]: tomo["hash"] for tomo in metadata["tomograms"]}
-    current_tomos = {os.path.basename(tomo): compute_file_hash(tomo) for tomo in tomograms}
+
+    # Compute hashes in parallel
+    with ProcessPoolExecutor() as executor:
+        future_to_tomo = {executor.submit(compute_file_hash, tomo): os.path.basename(tomo) for tomo in tomograms}
+        current_tomos = {}
+        for future in as_completed(future_to_tomo):
+            tomo_name = future_to_tomo[future]
+            try:
+                hash_value = future.result()
+                current_tomos[tomo_name] = hash_value
+            except Exception as exc:
+                print(f'Generating hash for {tomo_name} generated an exception: {exc}')
 
     return existing_tomos != current_tomos
 
@@ -863,13 +874,13 @@ def run_topaz_extract(model_file, input_dir, output_file, particle_radius, scale
     :param kwargs: Additional keyword arguments for Topaz extract.
     :return pd.DataFrame: DataFrame containing extracted particle coordinates and scores.
     """
+    # Base command with required arguments
     command = [
         "topaz", "extract",
         "--model", model_file,
         "--radius", str(particle_radius),
         "--up-scale", str(scale_factor),
-        "--output", output_file,
-        input_dir + "/*.mrc"
+        "--output", output_file
     ]
 
     # Add optional arguments from kwargs
@@ -889,9 +900,29 @@ def run_topaz_extract(model_file, input_dir, output_file, particle_radius, scale
         if value is not None:
             command.extend([arg, str(value)])
 
+    # Create a list of .mrc files
+    mrc_files = []
+    for root, _, files in os.walk(input_dir):
+        for file in files:
+            if file.endswith(".mrc"):
+                mrc_files.append(os.path.join(root, file))
+
+    # Convert the command list to a string
     cmd = " ".join(command)
     print_and_log(cmd)
-    subprocess.run(cmd, check=True, shell=True)
+    
+    # Run the command with input redirection (allows for very long lists of files to be picked without shell errors)
+    try:
+        process = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, text=True)
+        for file in mrc_files:
+            process.stdin.write(file + "\n")
+        process.stdin.close()
+        process.wait()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, cmd)
+    except subprocess.CalledProcessError as e:
+        print_and_log(f"Error running Topaz extract: {e}")
+        raise
 
 def read_predictions(pred_path):
     """
