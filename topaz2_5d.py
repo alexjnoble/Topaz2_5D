@@ -909,7 +909,7 @@ def run_topaz_extract(model_file, input_dir, output_file, particle_radius, scale
 
     # Convert the command list to a string
     cmd = " ".join(command)
-    print_and_log(cmd)
+    print_and_log(cmd + " [file list truncated]")
     
     # Run the command with input redirection (allows for very long lists of files to be picked without shell errors)
     try:
@@ -1182,9 +1182,8 @@ def save_aggregated_coordinates(final_particles, threshold, output_dir):
                 filename = os.path.join(output_dir, f"{tomogram}_{particle_type}.coords")
                 final_particles.loc[mask, ['x', 'y', 'z']].to_csv(filename, sep=' ', header=False, index=False)
 
-    print_and_log(f"All coordinates and scores saved: '{output_file}'")
+    print_and_log(f"All {len(final_particles)} coordinates and scores > {threshold} saved: '{output_file}'")
     print_and_log(f"Individual tomogram and particle type coords files saved in: {output_dir}")
-    print_and_log(f"All coordinates were saved with thresholded scores > {threshold}")
 
 def plot_training_metrics(file_path, train_sample_rate=1):
     """
