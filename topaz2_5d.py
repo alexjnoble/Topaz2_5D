@@ -148,7 +148,7 @@ def parse_args(script_start_time):
     general_group.add_argument("-n", "--num_slices", nargs='+', type=int, default=[10], help="Number of slices to extend symmetrically vertically for training and extraction for each particle type. For training, make this less than the minimum particle radius. For extraction, make this the average particle radius.")
     general_group.add_argument("--scale", type=int, default=1, help="Rescaling factor for tomogram down/upsampling, used in topaz preprocess and extract (default: 1)")
     general_group.add_argument("-e", "--expected_particles", type=int, default=500, help="Expected number of particles per tomogram for training")
-    general_group.add_argument("-T", "--test_split", type=float, default=0.2, help="Percentage of tomogram slices to use for testing; remaining are used for training (default: 0.2 = 20%")
+    general_group.add_argument("-T", "--test_split", type=float, default=0.2, help="Percentage of tomogram slices to use for testing; remaining are used for training (default: 0.2 = 20%%")
     general_group.add_argument("-w", "--num_workers", type=int, default=8, help="Number of worker threads to use for topaz train (default: 8)")
 
     # Preprocessing specific arguments
