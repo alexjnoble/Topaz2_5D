@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Author: Alex J. Noble, assisted by Claude 3.5 Sonnet & GPT4o, 2024 @SEMC, MIT License
+# Author: Alex J. Noble, assisted by Claude 3.5 Sonnet, GPT4o, and Gemini 2.5 Pro, 2024-25 @SEMC, MIT License
 #
 # Topaz 2.5D
 #
@@ -15,7 +15,7 @@
 #   https://www.gnu.org/licenses/gpl-3.0.en.html
 # Topaz source code and installation instructions: https://github.com/tbepler/topaz/
 # Ensure compliance with license terms when obtaining and using Topaz.
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import os
 import sys
@@ -124,6 +124,41 @@ def setup_logging(script_start_time, verbosity):
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
+def validate_device_arg(value):
+    """
+    Custom argparse type to validate the --device argument.
+    Allows a single integer or a comma-separated list of non-negative integers.
+    Prevents mixing negative device IDs (-1, -2) with non-negative GPU IDs (0, 1, ...).
+    Returns the original string if valid, otherwise raises an ArgumentTypeError.
+    """
+    try:
+        # Attempt to parse the value(s) into a list of integers.
+        # This handles both single numbers and comma-separated lists.
+        parts = value.split(',')
+        if not all(part.strip() for part in parts):
+            raise ValueError("Argument contains empty values (e.g., a trailing comma).")
+        
+        device_nums = [int(p.strip()) for p in parts]
+    except (ValueError, TypeError):
+        # This catches non-integer values like 'a' or empty strings.
+        raise argparse.ArgumentTypeError(
+            f"Invalid device value format: '{value}'. Must be a single integer "
+            f"or a comma-separated list of integers with no spaces (e.g., '0,1,2')."
+        )
+    # A list is only invalid if it contains more than one entry AND mixes device types.
+    if len(device_nums) > 1:
+        has_negative = any(num < 0 for num in device_nums)
+        has_non_negative = any(num >= 0 for num in device_nums)
+
+        # If both conditions are true, it's an invalid mix.
+        if has_negative and has_non_negative:
+            raise argparse.ArgumentTypeError(
+                f"Invalid combination in --device='{value}'. Cannot mix negative device IDs "
+                f"(like -1 for CPU or -2 for all GPUs) with specific non-negative GPU IDs (like 0, 1, etc.)."
+            )
+    # If all checks pass, the value is valid. Return the original string for the subprocess call.
+    return value
+
 def parse_args(script_start_time):
     """
     Parses command-line arguments.
@@ -161,7 +196,7 @@ def parse_args(script_start_time):
 
     # Training specific arguments
     topaz_train_group = parser.add_argument_group('\033[1mTraining Options\033[0m')
-    topaz_train_group.add_argument("--device", type=int, default=0, help="Which GPU device to use, set to -1 to force CPU (default: 0)")
+    topaz_train_group.add_argument("--device", type=validate_device_arg, default='-2', help="Which GPU device to use. Can be a single integer (e.g., 0 for GPU ID 0 or -1 for CPU), or a comma-separated list for multi-GPU execution (e.g., '0,1'), or -2 for all GPUs. (default: '-2')")
     topaz_train_group.add_argument("--format", choices=["auto", "coord", "csv", "star", "box"], default="auto", help="File format of the particle coordinates file (default: auto)")
     topaz_train_group.add_argument("--image_ext", help="Sets the image extension if loading images from directory. Should include '.' before the extension (default: find all extensions)")
     topaz_train_group.add_argument("--k_fold", type=int, help="Option to split the training set into K folds for cross validation (default: not used)")
@@ -900,29 +935,41 @@ def run_topaz_extract(model_file, input_dir, output_file, particle_radius, scale
         if value is not None:
             command.extend([arg, str(value)])
 
-    # Create a list of .mrc files
+    # Create a list of .mrc files to be processed
     mrc_files = []
     for root, _, files in os.walk(input_dir):
         for file in files:
             if file.endswith(".mrc"):
                 mrc_files.append(os.path.join(root, file))
 
-    # Convert the command list to a string
-    cmd = " ".join(command)
-    print_and_log(cmd + " [file list truncated]")
+    # --- NEW LOGIC TO HANDLE THE --input FLAG ---
     
-    # Run the command with input redirection (allows for very long lists of files to be picked without shell errors)
+    # Define a name for a temporary file that will list the input paths
+    input_list_filename = "topaz_extract_input_files.txt"
+
     try:
-        process = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, text=True)
-        for file in mrc_files:
-            process.stdin.write(file + "\n")
-        process.stdin.close()
-        process.wait()
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, cmd)
+        # Write the full path of each .mrc file to the temporary file
+        with open(input_list_filename, 'w') as f:
+            for file_path in mrc_files:
+                f.write(f"{file_path}\n")
+
+        # Add the new --input flag and the path to our list file to the command
+        command.extend(["--input", input_list_filename])
+
+        # Convert the command list to a string for logging and execution
+        cmd_str = " ".join(command)
+        print_and_log(f"Running command: {cmd_str}")
+
+        # Run the Topaz extract command
+        subprocess.run(cmd_str, check=True, shell=True)
+
     except subprocess.CalledProcessError as e:
-        print_and_log(f"Error running Topaz extract: {e}")
+        print_and_log(f"Error running Topaz extract: {e}", level=logging.ERROR)
         raise
+    finally:
+        # Ensure the temporary file is removed after the command is run
+        if os.path.exists(input_list_filename):
+            os.remove(input_list_filename)
 
 def read_predictions(pred_path):
     """
