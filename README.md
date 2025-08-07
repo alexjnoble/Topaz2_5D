@@ -2,31 +2,30 @@
 This script extends Topaz (2D) to pick slices of 3D tomograms given tomograms and corresponding 3D coordinates. It extends the capabilities of Topaz by preprocessing tomograms, training models on 2D slices, & aggregating 2D predictions into 3D coordinates.
 Topaz 2.5D extends the capabilities of Topaz to pick particles in 3D cryoET tomograms by training and predicting on tomogram slices. It preprocesses tomograms, trains models on 2D slices, and aggregates 2D predictions into 3D coordinates.
 
+## Release Notes
+
+### v1.0.1 - August 6, 2025
+
 #### Features
 
-- Generates 2D slices from 3D tomograms for training and prediction.
-- Trains Topaz models on 2D slices with extended 3D coordinates.
-- Aggregates 2D predictions into 3D coordinates, removing duplicates.
-- Training metrics are plotted and the best iteration is determined in 2 different ways.
-- Topaz scores from 2D predictions are retained in the 3D coordinates.
-- Topaz general model works; training is not necessary.
-- Competitive picking supported; pick multiple particle types simultaneously.
-- Parallel processing for faster tomogram slicing and coordinate aggregation.
-- Extensive customization options for preprocessing, training, and extraction.
-
-<details><summary>v1.0.1 - August 6, 2025</summary><p>
- 
    - Updated to be compatible with unreleased version of Topaz.
    - Added multi-GPU support.
    - Updated a flag change.
    - If using Topaz v0.2.5, use Topaz 2.5D v1.0.0.
 
-</p></details>
-
 <details><summary>v1.0.0 - November 5, 2024</summary><p>
  
    - v1.0.0 release.
    - Compatible with Topaz versions <= 0.2.5.
+   - Generates 2D slices from 3D tomograms for training and prediction.
+   - Trains Topaz models on 2D slices with extended 3D coordinates.
+   - Aggregates 2D predictions into 3D coordinates, removing duplicates.
+   - Training metrics are plotted and the best iteration is determined in 2 different ways.
+   - Topaz scores from 2D predictions are retained in the 3D coordinates.
+   - Topaz general model works; training is not necessary.
+   - Competitive picking supported; pick multiple particle types simultaneously.
+   - Parallel processing for faster tomogram slicing and coordinate aggregation.
+   - Extensive customization options for preprocessing, training, and extraction.
 
 </p></details>
 
