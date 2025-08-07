@@ -14,6 +14,22 @@ Topaz 2.5D extends the capabilities of Topaz to pick particles in 3D cryoET tomo
 - Parallel processing for faster tomogram slicing and coordinate aggregation.
 - Extensive customization options for preprocessing, training, and extraction.
 
+<details><summary>v1.0.1 - August 6, 2025</summary><p>
+ 
+   - Updated to be compatible with unreleased version of Topaz.
+   - Added multi-GPU support.
+   - Updated a flag change.
+   - If using Topaz v0.2.5, use Topaz 2.5D v1.0.0.
+
+</p></details>
+
+<details><summary>v1.0.0 - November 5, 2024</summary><p>
+ 
+   - v1.0.0 release.
+   - Compatible with Topaz versions <= 0.2.5.
+
+</p></details>
+
 ## Installation
 
 Topaz 2.5D requires Python 3, Topaz, and several dependencies, which can be installed using pip:
