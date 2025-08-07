@@ -8,7 +8,7 @@ Topaz 2.5D extends the capabilities of Topaz to pick particles in 3D cryoET tomo
 
 #### Features
 
-   - Updated to be compatible with unreleased version of Topaz.
+   - Updated to be compatible with a yet-to-be-released version of Topaz.
    - Added multi-GPU support.
    - Updated a flag change.
    - If using Topaz v0.2.5, use Topaz 2.5D v1.0.0.
